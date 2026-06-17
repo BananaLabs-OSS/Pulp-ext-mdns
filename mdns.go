@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"sync"
 	"time"
 
@@ -44,10 +45,34 @@ const (
 )
 
 var (
-	logger    = slog.Default()
-	announceM sync.Mutex
-	announced []*zeroconf.Server // kept alive for the host lifetime
+	logger         = slog.Default()
+	announceM      sync.Mutex
+	announced      []*zeroconf.Server // kept alive for the host lifetime
+	announcedPorts []uint32           // ports WE announced — used to exclude self from Browse
 )
+
+// localInterfaceIPs is the set of this host's own IP addresses (+ loopback), used to
+// recognise our own mDNS announcement among Browse results.
+func localInterfaceIPs() map[string]bool {
+	m := map[string]bool{"127.0.0.1": true, "::1": true}
+	if addrs, err := net.InterfaceAddrs(); err == nil {
+		for _, a := range addrs {
+			if ipn, ok := a.(*net.IPNet); ok {
+				m[ipn.IP.String()] = true
+			}
+		}
+	}
+	return m
+}
+
+func containsPort(ports []uint32, p uint32) bool {
+	for _, x := range ports {
+		if x == p {
+			return true
+		}
+	}
+	return false
+}
 
 func init() {
 	ext.Register(ext.Capability{
@@ -121,12 +146,23 @@ func mdnsBrowse(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, r
 	if err := resolver.Browse(bctx, req.Service, "local.", entries); err != nil {
 		return codeBrowseFail
 	}
+	// Exclude OUR OWN announcement(s): an entry on a local interface IP whose port we
+	// announced is this very host — don't list yourself as a pairable machine. (A second
+	// LOCAL instance on a DIFFERENT port is still shown, since its port isn't ours.)
+	announceM.Lock()
+	selfPorts := append([]uint32(nil), announcedPorts...)
+	announceM.Unlock()
+	localIPs := localInterfaceIPs()
 	var out []entry
 	for e := range entries {
 		if len(e.AddrIPv4) == 0 {
 			continue
 		}
-		out = append(out, entry{Name: e.Instance, Addr: fmt.Sprintf("http://%s:%d", e.AddrIPv4[0].String(), e.Port)})
+		ip := e.AddrIPv4[0].String()
+		if localIPs[ip] && containsPort(selfPorts, uint32(e.Port)) {
+			continue // this is us
+		}
+		out = append(out, entry{Name: e.Instance, Addr: fmt.Sprintf("http://%s:%d", ip, e.Port)})
 	}
 	payload, err := msgpack.Marshal(out)
 	if err != nil {
@@ -161,6 +197,7 @@ func mdnsAnnounce(m api.Module, reqPtr, reqLen uint32) uint32 {
 	}
 	announceM.Lock()
 	announced = append(announced, server)
+	announcedPorts = append(announcedPorts, req.Port)
 	announceM.Unlock()
 	return codeOK
 }
