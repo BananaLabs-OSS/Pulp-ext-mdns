@@ -190,6 +190,12 @@ func mdnsAnnounce(m api.Module, reqPtr, reqLen uint32) uint32 {
 	if req.Instance == "" {
 		req.Instance = "projx"
 	}
+	announceM.Lock()
+	if containsPort(announcedPorts, req.Port) {
+		announceM.Unlock()
+		return codeOK // idempotent: already announced on this port
+	}
+	announceM.Unlock()
 	server, err := zeroconf.Register(req.Instance, req.Service, "local.", int(req.Port), nil, nil)
 	if err != nil {
 		logger.Error("mdns announce", "err", err)
