@@ -47,8 +47,8 @@ const (
 var (
 	logger         = slog.Default()
 	announceM      sync.Mutex
-	announced      []*zeroconf.Server // kept alive for the host lifetime
-	announcedPorts []uint32           // ports WE announced — used to exclude self from Browse
+	announced      = map[string][]*zeroconf.Server{} // cellID → servers kept alive per cell
+	announcedPorts = map[string][]uint32{}            // cellID → ports WE announced per cell
 )
 
 // localInterfaceIPs is the set of this host's own IP addresses (+ loopback), used to
@@ -76,30 +76,49 @@ func containsPort(ports []uint32, p uint32) bool {
 
 func init() {
 	ext.Register(ext.Capability{
-		Name:     "discovery.mdns",
-		Setup:    func(env ext.SetupEnv) error { if env.Logger != nil { logger = env.Logger }; return nil },
-		Teardown: teardown,
-		Register: bindActive,
-		Stub:     bindStub,
+		Name:         "discovery.mdns",
+		Setup:        func(env ext.SetupEnv) error { if env.Logger != nil { logger = env.Logger }; return nil },
+		Teardown:     teardown,
+		TeardownCell: teardownCell,
+		Register:     bindActive,
+		Stub:         bindStub,
 	})
 }
 
 func teardown(_ context.Context) error {
 	announceM.Lock()
 	defer announceM.Unlock()
-	for _, s := range announced {
-		s.Shutdown()
+	for _, servers := range announced {
+		for _, s := range servers {
+			s.Shutdown()
+		}
 	}
-	announced = nil
+	announced = map[string][]*zeroconf.Server{}
+	announcedPorts = map[string][]uint32{}
 	return nil
 }
 
-func bindActive(b wazero.HostModuleBuilder, _ ext.Cell) error {
+func teardownCell(_ context.Context, cellID string) error {
+	announceM.Lock()
+	defer announceM.Unlock()
+	for _, s := range announced[cellID] {
+		s.Shutdown()
+	}
+	delete(announced, cellID)
+	delete(announcedPorts, cellID)
+	return nil
+}
+
+func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
+	cellID := ""
+	if cell != nil {
+		cellID = cell.Name()
+	}
 	b.NewFunctionBuilder().WithFunc(func(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 		return mdnsBrowse(ctx, m, reqPtr, reqLen, respPtrOut, respLenOut)
 	}).Export("mdns_browse")
 	b.NewFunctionBuilder().WithFunc(func(_ context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
-		return mdnsAnnounce(m, reqPtr, reqLen)
+		return mdnsAnnounce(m, cellID, reqPtr, reqLen)
 	}).Export("mdns_announce")
 	return nil
 }
@@ -149,8 +168,12 @@ func mdnsBrowse(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, r
 	// Exclude OUR OWN announcement(s): an entry on a local interface IP whose port we
 	// announced is this very host — don't list yourself as a pairable machine. (A second
 	// LOCAL instance on a DIFFERENT port is still shown, since its port isn't ours.)
+	// Aggregate across all cells so multi-cell hosts still exclude themselves correctly.
 	announceM.Lock()
-	selfPorts := append([]uint32(nil), announcedPorts...)
+	var selfPorts []uint32
+	for _, ports := range announcedPorts {
+		selfPorts = append(selfPorts, ports...)
+	}
 	announceM.Unlock()
 	localIPs := localInterfaceIPs()
 	var out []entry
@@ -171,7 +194,7 @@ func mdnsBrowse(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, r
 	return writeResp(ctx, m, payload, respPtrOut, respLenOut)
 }
 
-func mdnsAnnounce(m api.Module, reqPtr, reqLen uint32) uint32 {
+func mdnsAnnounce(m api.Module, cellID string, reqPtr, reqLen uint32) uint32 {
 	var req struct {
 		Instance string `msgpack:"instance"`
 		Service  string `msgpack:"service"`
@@ -191,7 +214,7 @@ func mdnsAnnounce(m api.Module, reqPtr, reqLen uint32) uint32 {
 		req.Instance = "projx"
 	}
 	announceM.Lock()
-	if containsPort(announcedPorts, req.Port) {
+	if containsPort(announcedPorts[cellID], req.Port) {
 		announceM.Unlock()
 		return codeOK // idempotent: already announced on this port
 	}
@@ -202,8 +225,8 @@ func mdnsAnnounce(m api.Module, reqPtr, reqLen uint32) uint32 {
 		return codeBrowseFail
 	}
 	announceM.Lock()
-	announced = append(announced, server)
-	announcedPorts = append(announcedPorts, req.Port)
+	announced[cellID] = append(announced[cellID], server)
+	announcedPorts[cellID] = append(announcedPorts[cellID], req.Port)
 	announceM.Unlock()
 	return codeOK
 }
