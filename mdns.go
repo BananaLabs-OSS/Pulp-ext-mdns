@@ -141,7 +141,7 @@ func mdnsBrowse(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, r
 		return codeBrowseFail
 	}
 	entries := make(chan *zeroconf.ServiceEntry, 16)
-	bctx, cancel := context.WithTimeout(context.Background(), timeout)
+	bctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	if err := resolver.Browse(bctx, req.Service, "local.", entries); err != nil {
 		return codeBrowseFail
